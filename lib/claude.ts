@@ -1,9 +1,3 @@
-import Anthropic from '@anthropic-ai/sdk';
-
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY || '',
-});
-
 const SYSTEM_PROMPT_TEMPLATE = `You are DocSaathi, an expert legal document analyzer. Your job is to help ordinary people — not lawyers — understand legal documents they need to sign.
 
 The user will give you extracted text or an image of a legal document. You must:
@@ -23,90 +17,119 @@ The user will give you extracted text or an image of a legal document. You must:
    - CAUTION (3-5 red flags or notable concerns)
    - HIGH_RISK (6+ red flags or any clause that could cause serious harm)
 
-5. Respond ONLY in valid JSON format — no markdown, no backticks, just raw JSON.
+5. Respond ONLY in valid JSON format matching the schema provided.
 
 IMPORTANT: Respond entirely in [TARGET_LANGUAGE]. If the target language is Hindi, write all explanations in Hindi. If Tamil, write in Tamil. Etc.
-
-JSON Response Format:
-{
-  "documentType": "string",
-  "overallRisk": "SAFE" | "CAUTION" | "HIGH_RISK",
-  "riskReason": "string — one sentence explaining the overall risk verdict",
-  "summary": ["bullet 1", "bullet 2", "bullet 3", "bullet 4", "bullet 5"],
-  "clauses": [
-    {
-      "title": "string",
-      "risk": "SAFE" | "CAUTION" | "RED_FLAG",
-      "originalText": "string — the actual clause text from the document",
-      "plainExplanation": "string — simple explanation",
-      "whyItMatters": "string — only for CAUTION and RED_FLAG"
-    }
-  ]
-}
 `;
 
-function cleanJsonResponse(text: string): string {
-  let cleaned = text.trim();
-  // Strip any markdown code block wraps (like ```json ... ``` or ``` ... ```)
-  if (cleaned.startsWith('```')) {
-    cleaned = cleaned.replace(/^```[a-zA-Z]*\n/, '');
-    if (cleaned.endsWith('```')) {
-      cleaned = cleaned.substring(0, cleaned.length - 3);
-    }
+async function callGemini(
+  systemPrompt: string,
+  userParts: any[],
+  useJsonSchema = false,
+  modelName = 'gemini-2.5-flash'
+): Promise<any> {
+  const apiKey = process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY || '';
+  if (!apiKey) {
+    throw new Error('API key is missing. Please set ANTHROPIC_API_KEY or GEMINI_API_KEY in your env settings.');
   }
-  return cleaned.trim();
-}
 
-async function callClaude(messages: any[], systemPrompt: string, retryCount = 0): Promise<any> {
-  const modelName = 'claude-3-5-sonnet-20241022';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+
+  const requestBody: any = {
+    systemInstruction: {
+      parts: [
+        {
+          text: systemPrompt,
+        },
+      ],
+    },
+    contents: [
+      {
+        role: 'user',
+        parts: userParts,
+      },
+    ],
+    generationConfig: {},
+  };
+
+  if (useJsonSchema) {
+    requestBody.generationConfig = {
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          documentType: { type: 'STRING' },
+          overallRisk: { type: 'STRING', enum: ['SAFE', 'CAUTION', 'HIGH_RISK'] },
+          riskReason: { type: 'STRING' },
+          summary: { type: 'ARRAY', items: { type: 'STRING' } },
+          clauses: {
+            type: 'ARRAY',
+            items: {
+              type: 'OBJECT',
+              properties: {
+                title: { type: 'STRING' },
+                risk: { type: 'STRING', enum: ['SAFE', 'CAUTION', 'RED_FLAG'] },
+                originalText: { type: 'STRING' },
+                plainExplanation: { type: 'STRING' },
+                whyItMatters: { type: 'STRING' },
+              },
+              required: ['title', 'risk', 'originalText', 'plainExplanation'],
+            },
+          },
+        },
+        required: ['documentType', 'overallRisk', 'riskReason', 'summary', 'clauses'],
+      },
+    };
+  }
+
   try {
-    const response = await anthropic.messages.create({
-      model: modelName,
-      max_tokens: 4000,
-      system: systemPrompt,
-      messages: messages,
-      temperature: 0.1, // low temperature for structured output
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(requestBody),
     });
 
-    const textContent = response.content.find(c => c.type === 'text');
-    if (!textContent || !('text' in textContent)) {
-      throw new Error('Claude did not return text content.');
-    }
-
-    const rawText = textContent.text;
-    const cleanedText = cleanJsonResponse(rawText);
-
-    try {
-      return JSON.parse(cleanedText);
-    } catch (parseError) {
-      console.error(`JSON Parse Error on attempt ${retryCount + 1}:`, parseError, 'Raw response:', rawText);
-      if (retryCount < 1) {
-        // Retry once by prompting again with the malformed output
-        console.log('Retrying Claude API call due to malformed JSON...');
-        const retryMessages = [
-          ...messages,
-          { role: 'assistant', content: rawText },
-          { role: 'user', content: 'Your response was not valid JSON. Please output only the valid raw JSON object matching the format exactly. Do not wrap in markdown or backticks.' }
-        ];
-        return callClaude(retryMessages, systemPrompt, retryCount + 1);
+    if (!response.ok) {
+      const errorText = await response.text();
+      // If gemini-2.5-flash fails or is not found, attempt falling back to gemini-1.5-flash
+      if (modelName === 'gemini-2.5-flash') {
+        console.warn(`gemini-2.5-flash failed with status ${response.status}. Falling back to gemini-1.5-flash...`);
+        return callGemini(systemPrompt, userParts, useJsonSchema, 'gemini-1.5-flash');
       }
-      throw parseError;
+      throw new Error(`Gemini API error (Status ${response.status}): ${errorText}`);
     }
+
+    const data = await response.json();
+    const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!candidateText) {
+      throw new Error('No content returned from Gemini API.');
+    }
+
+    if (useJsonSchema) {
+      return JSON.parse(candidateText.trim());
+    }
+
+    return candidateText;
   } catch (error) {
-    console.error('Error in callClaude:', error);
+    // Attempt fallback for network/unexpected errors as well
+    if (modelName === 'gemini-2.5-flash') {
+      console.warn('Unexpected error with gemini-2.5-flash. Falling back to gemini-1.5-flash...', error);
+      return callGemini(systemPrompt, userParts, useJsonSchema, 'gemini-1.5-flash');
+    }
     throw error;
   }
 }
 
 export async function analyzeDocumentText(text: string, targetLanguageName: string): Promise<any> {
   const systemPrompt = SYSTEM_PROMPT_TEMPLATE.replace('[TARGET_LANGUAGE]', targetLanguageName);
-  const messages = [
+  const userParts = [
     {
-      role: 'user',
-      content: `Analyze the following legal document text and output the results in ${targetLanguageName} as JSON:\n\n${text}`
+      text: `Analyze the following legal document text and output the results in ${targetLanguageName} as JSON:\n\n${text}`
     }
   ];
-  return callClaude(messages, systemPrompt);
+  return callGemini(systemPrompt, userParts, true);
 }
 
 export async function analyzeDocumentImage(
@@ -115,26 +138,18 @@ export async function analyzeDocumentImage(
   targetLanguageName: string
 ): Promise<any> {
   const systemPrompt = SYSTEM_PROMPT_TEMPLATE.replace('[TARGET_LANGUAGE]', targetLanguageName);
-  const messages = [
+  const userParts = [
     {
-      role: 'user',
-      content: [
-        {
-          type: 'image',
-          source: {
-            type: 'base64',
-            media_type: imageMimeType as any,
-            data: imageBase64,
-          },
-        },
-        {
-          type: 'text',
-          content: `Analyze this image of a legal document and output the results in ${targetLanguageName} as JSON. Read all text via OCR first.`
-        }
-      ] as any
+      inlineData: {
+        mimeType: imageMimeType,
+        data: imageBase64,
+      },
+    },
+    {
+      text: `Analyze this image of a legal document and output the results in ${targetLanguageName} as JSON. Read all text via OCR first.`
     }
   ];
-  return callClaude(messages, systemPrompt);
+  return callGemini(systemPrompt, userParts, true);
 }
 
 export async function askFollowUpQuestion(
@@ -142,24 +157,12 @@ export async function askFollowUpQuestion(
   question: string,
   targetLanguageName: string
 ): Promise<string> {
-  try {
-    const response = await anthropic.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 1000,
-      system: `You are DocSaathi, an expert legal document analyzer. Answer the user's question about their document in simple, clear language in ${targetLanguageName}. Avoid legalese and explain clearly. Document content is provided below.`,
-      messages: [
-        {
-          role: 'user',
-          content: `Here is the legal document text:\n\n${documentContext}\n\nUser Question: ${question}`
-        }
-      ],
-      temperature: 0.3,
-    });
-    
-    const textContent = response.content.find(c => c.type === 'text');
-    return textContent && 'text' in textContent ? textContent.text : 'Sorry, I could not generate an answer.';
-  } catch (error) {
-    console.error('Error in askFollowUpQuestion:', error);
-    throw error;
-  }
+  const systemPrompt = `You are DocSaathi, an expert legal document analyzer. Answer the user's question about their document in simple, clear language in ${targetLanguageName}. Avoid legalese and explain clearly. Document content is provided below.`;
+  const userParts = [
+    {
+      text: `Here is the legal document text:\n\n${documentContext}\n\nUser Question: ${question}`
+    }
+  ];
+  return callGemini(systemPrompt, userParts, false);
 }
+
